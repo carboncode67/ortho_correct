@@ -14,6 +14,7 @@ import numpy as np
 import rasterio
 from rasterio.transform import Affine
 from scipy.spatial import cKDTree
+from pyproj import Transformer
 
 # ---------------------------------------------------------------------------
 # CONFIGURE THESE
@@ -29,8 +30,8 @@ CORRECTED_X_COL = "X"
 CORRECTED_Y_COL = "Y"
 
 # Column names in each GCP CSV (uncorrected position, read from first data row)
-GCP_EASTING_COL  = "Base Easting"
-GCP_NORTHING_COL = "Base Northing"
+GCP_LAT_COL = "Base latitude"
+GCP_LON_COL = "Base longitude"
 
 # Max distance (metres) for point-to-point matching
 POINT_MATCH_THRESHOLD = 5.0
@@ -57,7 +58,22 @@ def load_corrected_points(csv_path: Path) -> pd.DataFrame:
     return df
 
 
-def load_gcp_points(gcp_dir: Path) -> pd.DataFrame:
+def get_tif_crs(tiff_dir: Path) -> str:
+    """Return the CRS string of the first TIF found under tiff_dir."""
+    for p in tiff_dir.rglob("*"):
+        if p.suffix.lower() in (".tif", ".tiff"):
+            with rasterio.open(p) as src:
+                if src.crs is None:
+                    raise ValueError(f"TIF has no CRS: {p}")
+                print(f"  Detected TIF CRS: {src.crs} (from {p.name})")
+                return str(src.crs)
+    raise FileNotFoundError(f"No TIF files found under {tiff_dir} to detect CRS")
+
+
+def load_gcp_points(gcp_dir: Path, tif_crs: str) -> pd.DataFrame:
+    """Load GCP CSVs and reproject lat/lon to the TIF's projected CRS."""
+    transformer = Transformer.from_crs("EPSG:4326", tif_crs, always_xy=True)
+
     csv_files = find_files(gcp_dir, (".csv",))
     if not csv_files:
         raise FileNotFoundError(f"No CSV files found under {gcp_dir}")
@@ -65,12 +81,13 @@ def load_gcp_points(gcp_dir: Path) -> pd.DataFrame:
     for f in csv_files:
         try:
             df = pd.read_csv(f, nrows=1)
-            x = df[GCP_EASTING_COL].iloc[0]
-            y = df[GCP_NORTHING_COL].iloc[0]
-            if pd.isna(x) or pd.isna(y):
+            lat = df[GCP_LAT_COL].iloc[0]
+            lon = df[GCP_LON_COL].iloc[0]
+            if pd.isna(lat) or pd.isna(lon):
                 print(f"  SKIP {f.name}: NaN coordinates")
                 continue
-            rows.append({"x": float(x), "y": float(y), "source": f.name})
+            x, y = transformer.transform(float(lon), float(lat))
+            rows.append({"x": x, "y": y, "source": f.name})
         except Exception as e:
             print(f"  SKIP {f.name}: {e}")
     if not rows:
@@ -134,8 +151,11 @@ def main():
     print("Loading corrected points...")
     corrected = load_corrected_points(CORRECTED_CSV)
 
+    print("Detecting TIF CRS...")
+    tif_crs = get_tif_crs(TIFF_DIR)
+
     print("Loading uncorrected GCP points...")
-    uncorrected = load_gcp_points(GCP_DIR)
+    uncorrected = load_gcp_points(GCP_DIR, tif_crs)
 
     # 2. Match points and compute offsets
     print("Matching GCP points to corrected positions...")
